@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a GNU Radio OFDM packet communication system implementing full packet TX/RX over TUN/TAP network interfaces. It is authored by Barry Duggan and runs in loopback mode (TX directly feeds RX) for development and testing.
+A GNU Radio OFDM packet communication system implementing a simulated one-way RF link between two TAP network interfaces (`tnc0` and `tnc1`). Authored by Barry Duggan. Early-stage prototype; ping works in both directions.
 
 ## How to Run
 
@@ -12,50 +12,53 @@ This is a GNU Radio OFDM packet communication system implementing full packet TX
 python3 pkt_8.py
 ```
 
-Requires root or network admin privileges for TUN/TAP device access (`tnc0`, `tnc1`).
+Requires root or `CAP_NET_ADMIN` for TUN/TAP device access. Press Enter to stop cleanly.
 
-The GRC flowgraph can be opened and modified in GNU Radio Companion:
-```bash
-gnuradio-companion Pkt_8.grc
-```
+Edit the flowgraph in GNU Radio Companion, then regenerate `pkt_8.py`:
+- **GUI:** Run → Generate (F5)
+- **CLI:** `grcc Pkt_8.grc`
 
-After editing `Pkt_8.grc` in GNU Radio Companion, regenerate `pkt_8.py` via **Run > Generate** (or F5) in the GUI. Do not manually edit `pkt_8.py` — it is auto-generated from the `.grc` file.
+Do not edit `pkt_8.py` directly — it is auto-generated from `Pkt_8.grc`.
 
 ## Architecture
 
-The system has two independent packet paths (path 0 via `tnc0`, path 1 via `tnc1`) that each follow the same pipeline.
+The two paths are **asymmetric** — only one direction uses the OFDM RF simulation.
 
-### TX Pipeline (per path)
+### tnc0 → tnc1 (RF path)
 ```
-TUN/TAP (network) → CRC-32 append → Protocol formatter (access code header)
-  → PDU-to-tagged-stream (header + payload separately)
-  → Tagged stream mux → OFDM TX (FFT=64, CP=16, BPSK header, QPSK payload)
+tnc0 → CRC-32 append → PDU-to-tagged-stream
+     → OFDM TX (FFT=64, CP=16)
+     → OFDM RX
+     → tagged-stream-to-PDU → CRC check → tnc1 + message_debug
 ```
+The `digital_crc_append_0` output feeds directly into `pdu_pdu_to_tagged_stream_0` (tag `packet_len_0`) without a protocol formatter. The OFDM TX block handles its own internal framing (sync preamble + header + payload).
 
-### RX Pipeline (loopback from TX output)
+### tnc1 → tnc0 (return path, no RF)
 ```
-OFDM RX → Tagged-stream-to-PDU → CRC check
-  → TUN/TAP output + message debug logger
+tnc1 → CRC-32 append → Protocol formatter (header/payload split)
+     → PDU-to-tagged-stream (x2) → tagged-stream mux
+     → bit repack (8→1) → [virtual sink/source] → access code correlator
+     → bit repack (1→8) → tagged-stream-to-PDU → CRC check → tnc0
 ```
-
-Path 1 also has an additional access code correlator branch that demodulates raw bits to a virtual sink (`demod_bits_1`).
+This path uses the access code correlator (`correlate_access_code_bb_ts`) for framing instead of OFDM. The protocol formatter and access code are only used here.
 
 ### Key Parameters
 - **FFT size**: 64, **Cyclic prefix**: 16
-- **Occupied carriers**: `(-2,-1,1,3)` and `(-3,-1,1,2)`
-- **Pilot carriers**: `(-3,2)` and `(-2,3)`
-- **Access code**: `11100001010110101110100010010011` (32-bit)
+- **Occupied carriers**: `(-4,-3,-2,-1,1,2,3,4)` — 8 carriers, single group, no DC
+- **Pilot carriers**: `(-6,-5,5,6)` — 4 pilots
+- **sync_word1 / sync_word2**: `None` (GNU Radio internal defaults)
 - **Header mod**: BPSK | **Payload mod**: QPSK
-- **CRC polynomial**: 0x4C11DB7 (32-bit)
-- **MTU**: 576 bytes (TUN/TAP)
+- **CRC**: 32-bit, poly 0x4C11DB7, reflected I/O
+- **Access code**: `11100001010110101110100010010011` (return path only)
+- **MTU**: 576 bytes
 
-### Message Passing vs. Stream Connections
-GNU Radio uses two connection types here:
-- **Message/PDU connections** (async): CRC → formatter → PDU converters → CRC check → TUN/TAP
-- **Stream connections** (synchronous): bit repack/mux chains, OFDM TX→RX loopback
+### Buffer Sizing
+Both `digital_ofdm_tx_0_0` and `digital_ofdm_rx_0_0` have `set_min_output_buffer(100000)`. This is required because `header_payload_demux` (internal to `ofdm_rx`) must buffer a complete packet before outputting — the default GNU Radio buffer is too small.
 
-### Debug Data Files
-The `.dat` files in the repo root are probe/logging outputs from intermediate points in the signal chain (e.g., `tx-hdr.dat`, `post-payload-eq.dat`). They are populated when the flowgraph runs with logging enabled (`log=True` on OFDM blocks).
+### Debug / Observation
+- `blocks_tag_debug_0` monitors the OFDM RX output stream (display disabled by default, tag name `"Rx Packets"`)
+- `blocks_message_debug_0` prints CRC-passing packets from the RF path to stdout
+- `debug_log=False` on OFDM blocks (set to `True` to enable `.dat` probe files)
 
 ## Dependencies
 
